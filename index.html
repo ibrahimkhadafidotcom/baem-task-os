@@ -63,7 +63,7 @@
       <form id="setupForm" class="form-stack">
         <label class="field">
           <span>URL Backend Apps Script</span>
-          <input id="backendUrlInput" type="url" required placeholder="https://script.google.com/macros/s/.../exec" autocomplete="off">
+          <input id="backendUrlInput" type="text" required placeholder="Tempel Web app URL atau Deployment ID" autocomplete="off" spellcheck="false">
         </label>
         <button class="button primary wide" type="submit">
           <span>Hubungkan Aplikasi</span>
@@ -437,9 +437,28 @@ function getApiUrl() {
   return String(config().API_URL || localStorage.getItem('baem_api_url') || '').trim();
 }
 
+function normalizeBackendUrl(value) {
+  let text = String(value || '').trim().replace(/^['"]|['"]$/g, '');
+  text = text.replace(/\s+/g, '');
+
+  const fullUrlMatch = text.match(/https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/(?:exec|dev)/i);
+  if (fullUrlMatch) text = fullUrlMatch[0];
+
+  if (/^[A-Za-z0-9_-]{20,}$/.test(text)) {
+    text = `https://script.google.com/macros/s/${text}/exec`;
+  }
+
+  if (/^script\.google\.com\/macros\/s\//i.test(text)) {
+    text = `https://${text}`;
+  }
+
+  text = text.replace(/\/dev$/i, '/exec');
+  return text;
+}
+
 function isValidBackendUrl(value) {
   try {
-    const url = new URL(value);
+    const url = new URL(normalizeBackendUrl(value));
     return url.protocol === 'https:' && url.hostname === 'script.google.com' && url.pathname.endsWith('/exec');
   } catch (_) {
     return false;
@@ -488,57 +507,46 @@ function bridgeRequest(payload) {
     }
 
     const requestId = `REQ-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const frameName = `baem_bridge_${requestId.replace(/[^a-zA-Z0-9_]/g, '_')}`;
-    const iframe = document.createElement('iframe');
-    iframe.name = frameName;
-    iframe.hidden = true;
-    iframe.setAttribute('aria-hidden', 'true');
-
-    const form = document.createElement('form');
-    form.method = 'POST';
-    form.action = apiUrl;
-    form.target = frameName;
-    form.hidden = true;
-
-    const fields = {
-      bridge: '1',
-      origin: window.location.origin,
-      payload: JSON.stringify({ ...payload, request_id: requestId })
-    };
-    Object.entries(fields).forEach(([name, value]) => {
-      const input = document.createElement('input');
-      input.type = 'hidden';
-      input.name = name;
-      input.value = value;
-      form.appendChild(input);
-    });
-
+    const callbackName = `__baem_jsonp_${requestId.replace(/[^a-zA-Z0-9_]/g, '_')}`;
+    const script = document.createElement('script');
     let settled = false;
+
     const cleanup = () => {
-      window.removeEventListener('message', onMessage);
-      iframe.remove();
-      form.remove();
+      if (script.parentNode) script.remove();
+      try { delete window[callbackName]; } catch (_) { window[callbackName] = undefined; }
     };
+
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
       cleanup();
-      reject(new Error('Backend tidak merespons. Periksa URL Apps Script dan deployment.'));
-    }, Number(config().REQUEST_TIMEOUT_MS || 30000));
+      reject(new Error('Backend tidak merespons dalam 20 detik. Pastikan deployment menggunakan versi terbaru dan aksesnya Anyone.'));
+    }, Number(config().REQUEST_TIMEOUT_MS || 20000));
 
-    function onMessage(event) {
-      const data = event.data;
-      if (!data || data.source !== 'baem-task-os' || data.requestId !== requestId) return;
+    window[callbackName] = result => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       cleanup();
-      resolve(data.result);
-    }
+      resolve(result);
+    };
 
-    window.addEventListener('message', onMessage);
-    document.body.append(iframe, form);
-    form.submit();
+    script.onerror = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cleanup();
+      reject(new Error('Gagal membuka backend. Periksa Web app URL dan pengaturan akses deployment.'));
+    };
+
+    const url = new URL(apiUrl);
+    url.searchParams.set('jsonp', '1');
+    url.searchParams.set('callback', callbackName);
+    url.searchParams.set('payload', JSON.stringify({ ...payload, request_id: requestId }));
+    url.searchParams.set('_', String(Date.now()));
+    script.src = url.toString();
+    script.async = true;
+    document.head.appendChild(script);
   });
 }
 
@@ -821,17 +829,32 @@ function closeModal(dialog) {
 }
 
 function bindEvents() {
-  qs('#setupForm').addEventListener('submit', event => {
+  qs('#setupForm').addEventListener('submit', async event => {
     event.preventDefault();
-    const value = qs('#backendUrlInput').value.trim();
+    const button = event.submitter || qs('#setupForm button[type="submit"]');
+    const rawValue = qs('#backendUrlInput').value;
+    const value = normalizeBackendUrl(rawValue);
     if (!isValidBackendUrl(value)) {
-      toast('URL tidak valid', 'Gunakan URL Apps Script yang berakhir dengan /exec.', 'error');
+      toast('URL tidak valid', 'Tempel Web app URL lengkap atau Deployment ID Apps Script.', 'error');
       return;
     }
+
+    qs('#backendUrlInput').value = value;
     localStorage.setItem('baem_api_url', value);
     state.apiUrl = value;
-    showScreen('loginScreen');
-    toast('Backend terhubung', 'Silakan login menggunakan akunmu.');
+    setLoading(button, true);
+
+    try {
+      await api('health');
+      showScreen('loginScreen');
+      toast('Backend terhubung', 'Koneksi berhasil. Silakan login menggunakan akunmu.');
+    } catch (error) {
+      localStorage.removeItem('baem_api_url');
+      state.apiUrl = '';
+      toast('Backend belum terhubung', error.message, 'error');
+    } finally {
+      setLoading(button, false);
+    }
   });
   qs('#changeBackendButton').addEventListener('click', () => {
     qs('#backendUrlInput').value = getApiUrl();
