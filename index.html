@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#6d5dfc">
   <meta name="description" content="Baem Task OS — pusat delegasi, progres, dan akuntabilitas tim.">
+  <meta name="baem-version" content="1.4.0">
   <title>Baem Task OS</title>
   <style>
 :root{
@@ -428,7 +429,9 @@ const state = {
   currentView: 'dashboard',
   taskLayout: 'table',
   dashboardFilter: 'active',
-  editingTeamId: ''
+  editingTeamId: '',
+  backendVersion: '',
+  lastSyncAt: ''
 };
 
 const qs = (selector, root = document) => root.querySelector(selector);
@@ -588,23 +591,34 @@ async function initialize() {
   }
 }
 
-async function bootstrap() {
-  const result = await api('bootstrap', { session_token: state.sessionToken });
-  state.user = result.user;
-  state.summary = result.summary || {};
-  state.teams = result.teams || [];
-  state.projects = result.projects || [];
-  state.tasks = result.tasks || [];
-
-  if (['OWNER', 'ADMIN', 'LEADER'].includes(state.user.role)) {
-    try {
-      const usersResult = await api('listUsers', { session_token: state.sessionToken });
-      state.users = usersResult.users || [];
-    } catch (_) {
-      state.users = [];
-    }
+function applySnapshot(result) {
+  if (!result || !result.user) {
+    throw new Error('Backend tidak mengirim data pengguna.');
   }
 
+  state.user = result.user;
+  state.users = Array.isArray(result.users) ? result.users : [result.user];
+  state.teams = Array.isArray(result.teams) ? result.teams : [];
+  state.projects = Array.isArray(result.projects) ? result.projects : [];
+  state.tasks = Array.isArray(result.tasks) ? result.tasks : [];
+  state.summary = result.summary || {};
+  state.backendVersion = result.backend_version || '';
+  state.lastSyncAt = result.generated_at || '';
+
+  const diagnostics = result.diagnostics || {};
+  const mismatches = [];
+  if (Number(diagnostics.users_returned || 0) > 0 && state.users.length === 0) mismatches.push('pengguna');
+  if (Number(diagnostics.teams_returned || 0) > 0 && state.teams.length === 0) mismatches.push('tim');
+  if (Number(diagnostics.tasks_returned || 0) > 0 && state.tasks.length === 0) mismatches.push('tugas');
+
+  if (mismatches.length) {
+    throw new Error(`Sinkronisasi ${mismatches.join(', ')} tidak lengkap.`);
+  }
+}
+
+async function bootstrap() {
+  const result = await api('bootstrap', { session_token: state.sessionToken });
+  applySnapshot(result);
   showScreen('appShell');
   renderAll();
   if (state.user.must_change_pin) openModal('pinModal');
@@ -635,6 +649,8 @@ function renderUser() {
   const hour = new Date().getHours();
   const greeting = hour < 11 ? 'Selamat pagi' : hour < 15 ? 'Selamat siang' : hour < 19 ? 'Selamat sore' : 'Selamat malam';
   qs('#welcomeHeading').textContent = `${greeting}, ${String(user.full_name || 'Capt').split(' ')[0]}!`;
+  const versionText = state.backendVersion ? `Backend v${state.backendVersion}` : 'Backend terhubung';
+  qs('#sidebarUser').title = `${versionText}${state.lastSyncAt ? ` · Sinkron ${state.lastSyncAt}` : ''}`;
 }
 
 function renderProjects() {
@@ -888,10 +904,7 @@ function bindStatusInputs(root) {
 
 async function refreshData() {
   const result = await api('bootstrap', { session_token: state.sessionToken });
-  state.summary = result.summary || {};
-  state.teams = result.teams || [];
-  state.projects = result.projects || [];
-  state.tasks = result.tasks || [];
+  applySnapshot(result);
   renderAll();
 }
 
@@ -1012,10 +1025,16 @@ function bindEvents() {
 
   qs('#userForm').addEventListener('submit', async event => {
     event.preventDefault();
+    const button = event.submitter;
+    setLoading(button, true);
     try {
       const result = await api('createUser', { session_token: state.sessionToken, user: { full_name: qs('#userName').value, email: qs('#userEmail').value, role: qs('#userRole').value, team_id: qs('#userTeam').value }});
       event.target.reset(); closeModal(qs('#userModal')); await bootstrap(); toast('Pengguna dibuat', `PIN sementara: ${result.temporary_pin}`);
-    } catch (error) { toast('Gagal membuat pengguna', error.message, 'error'); }
+    } catch (error) {
+      toast('Gagal membuat pengguna', error.message, 'error');
+    } finally {
+      setLoading(button, false);
+    }
   });
 
   qs('#teamForm').addEventListener('submit', async event => {
@@ -1057,10 +1076,16 @@ function bindEvents() {
 
   qs('#projectForm').addEventListener('submit', async event => {
     event.preventDefault();
+    const button = event.submitter;
+    setLoading(button, true);
     try {
       await api('createProject', { session_token: state.sessionToken, project: { project_name: qs('#projectName').value, description: qs('#projectDescription').value, start_date: qs('#projectStart').value, end_date: qs('#projectEnd').value }});
       event.target.reset(); closeModal(qs('#projectModal')); await bootstrap(); toast('Project dibuat');
-    } catch (error) { toast('Gagal membuat project', error.message, 'error'); }
+    } catch (error) {
+      toast('Gagal membuat project', error.message, 'error');
+    } finally {
+      setLoading(button, false);
+    }
   });
 
   qs('#pinForm').addEventListener('submit', async event => {
